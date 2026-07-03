@@ -1430,6 +1430,16 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
         );
     }
 
+    // VCF REF/ALT lengths drive MAF Frame_Shift/In_Frame Del-vs-Ins resolution;
+    // their difference is the indel size (the shared anchor base cancels).
+    let (ref_len, alt_len) = match &vf.vcf_fields {
+        Some(vcf) => (vcf.ref_allele.len(), vcf.alt.len()),
+        None => {
+            let r = vf.ref_allele.to_string();
+            (if r == "-" { 0 } else { r.len() }, 0)
+        }
+    };
+
     let transcript_consequences: Vec<serde_json::Value> = vf
         .transcript_variations
         .iter()
@@ -1463,6 +1473,16 @@ pub fn format_json(vf: &VariationFeature, sa_only: bool) -> serde_json::Value {
                             .collect(),
                     ),
                 );
+                if let Some(vc) = Consequence::maf_variant_classification_from(
+                    &aa.consequences,
+                    ref_len,
+                    alt_len,
+                ) {
+                    tc.insert(
+                        "variant_classification".into(),
+                        serde_json::Value::String(vc.to_string()),
+                    );
+                }
                 tc.insert(
                     "impact".into(),
                     serde_json::Value::String(aa.impact.as_str().to_string()),

@@ -322,6 +322,72 @@ impl Consequence {
     pub fn worst_impact(consequences: &[Consequence]) -> Option<Impact> {
         consequences.iter().map(|c| c.impact()).min()
     }
+
+    /// Map this consequence to the MAF `Variant_Classification` label used by
+    /// cBioPortal and Genome Nexus, following mskcc/vcf2maf's effect→class rules.
+    ///
+    /// `is_del` selects Del vs Ins for length-changing indels; `inframe` selects
+    /// frameshift vs in-frame for the length-ambiguous `protein_altering_variant`
+    /// (and mirrors vcf2maf's handling of `frameshift_variant` reported inframe).
+    pub fn maf_variant_classification(self, is_del: bool, inframe: bool) -> &'static str {
+        use Consequence::*;
+        match self {
+            SpliceAcceptorVariant | SpliceDonorVariant | TranscriptAblation => "Splice_Site",
+            StopGained => "Nonsense_Mutation",
+            StopLost => "Nonstop_Mutation",
+            StartLost => "Translation_Start_Site",
+            InframeInsertion => "In_Frame_Ins",
+            InframeDeletion => "In_Frame_Del",
+            FrameshiftVariant | ProteinAlteringVariant => match (inframe, is_del) {
+                (false, true) => "Frame_Shift_Del",
+                (false, false) => "Frame_Shift_Ins",
+                (true, true) => "In_Frame_Del",
+                (true, false) => "In_Frame_Ins",
+            },
+            MissenseVariant | CodingSequenceVariant => "Missense_Mutation",
+            TranscriptAmplification | IntronVariant => "Intron",
+            SpliceRegionVariant => "Splice_Region",
+            // vcf2maf.pl maps only bare splice_region_variant; the finer splice
+            // sub-types (5th-base / donor-region / polypyrimidine-tract) are not
+            // in its table and fall through to Targeted_Region.
+            IncompleteTerminalCodonVariant
+            | StartRetainedVariant
+            | StopRetainedVariant
+            | SynonymousVariant
+            | NmdTranscriptVariant => "Silent",
+            MatureMirnaVariant
+            | NonCodingTranscriptExonVariant
+            | NonCodingTranscriptVariant
+            | CodingTranscriptVariant => "RNA",
+            FivePrimeUtrVariant => "5'UTR",
+            ThreePrimeUtrVariant => "3'UTR",
+            UpstreamGeneVariant => "5'Flank",
+            DownstreamGeneVariant => "3'Flank",
+            TfbsAblation
+            | TfbsAmplification
+            | TfBindingSiteVariant
+            | RegulatoryRegionAblation
+            | RegulatoryRegionAmplification
+            | RegulatoryRegionVariant
+            | IntergenicVariant => "IGR",
+            _ => "Targeted_Region",
+        }
+    }
+
+    /// Pick the most severe consequence from `consequences` and map it to a MAF
+    /// `Variant_Classification`. `ref_len`/`alt_len` are the VCF REF/ALT allele
+    /// lengths; their difference gives the indel size (the shared anchor base
+    /// cancels) used to resolve Del/Ins direction and reading frame.
+    pub fn maf_variant_classification_from(
+        consequences: &[Consequence],
+        ref_len: usize,
+        alt_len: usize,
+    ) -> Option<&'static str> {
+        let is_del = ref_len > alt_len;
+        let inframe = (ref_len as i64 - alt_len as i64) % 3 == 0;
+        Consequence::most_severe(consequences)
+            .map(|c| c.maf_variant_classification(is_del, inframe))
+    }
 }
 
 impl PartialOrd for Consequence {
@@ -359,6 +425,60 @@ mod tests {
         assert!(Impact::High < Impact::Moderate);
         assert!(Impact::Moderate < Impact::Low);
         assert!(Impact::Low < Impact::Modifier);
+    }
+
+    #[test]
+    fn test_maf_variant_classification() {
+        use Consequence::*;
+        // SNV effects
+        assert_eq!(MissenseVariant.maf_variant_classification(false, false), "Missense_Mutation");
+        assert_eq!(StopGained.maf_variant_classification(false, false), "Nonsense_Mutation");
+        assert_eq!(StopLost.maf_variant_classification(false, false), "Nonstop_Mutation");
+        assert_eq!(StartLost.maf_variant_classification(false, false), "Translation_Start_Site");
+        assert_eq!(SynonymousVariant.maf_variant_classification(false, false), "Silent");
+        assert_eq!(SpliceAcceptorVariant.maf_variant_classification(false, false), "Splice_Site");
+        assert_eq!(SpliceRegionVariant.maf_variant_classification(false, false), "Splice_Region");
+        // vcf2maf does not classify the finer splice sub-types -> Targeted_Region
+        assert_eq!(SpliceDonorFifthBaseVariant.maf_variant_classification(false, false), "Targeted_Region");
+        assert_eq!(SplicePolypyrimidineTractVariant.maf_variant_classification(false, false), "Targeted_Region");
+        assert_eq!(IntronVariant.maf_variant_classification(false, false), "Intron");
+        assert_eq!(FivePrimeUtrVariant.maf_variant_classification(false, false), "5'UTR");
+        assert_eq!(UpstreamGeneVariant.maf_variant_classification(false, false), "5'Flank");
+        // Indels: Del/Ins + frame resolution
+        assert_eq!(FrameshiftVariant.maf_variant_classification(true, false), "Frame_Shift_Del");
+        assert_eq!(FrameshiftVariant.maf_variant_classification(false, false), "Frame_Shift_Ins");
+        assert_eq!(InframeDeletion.maf_variant_classification(true, true), "In_Frame_Del");
+        assert_eq!(InframeInsertion.maf_variant_classification(false, true), "In_Frame_Ins");
+    }
+
+    #[test]
+    fn test_maf_classification_from_lengths() {
+        use Consequence::*;
+        // 3bp deletion (ref=4,alt=1 -> size 3, inframe) reported as inframe_deletion
+        assert_eq!(
+            Consequence::maf_variant_classification_from(&[InframeDeletion], 4, 1),
+            Some("In_Frame_Del")
+        );
+        // 1bp deletion (ref=2,alt=1 -> size 1, frameshift)
+        assert_eq!(
+            Consequence::maf_variant_classification_from(&[FrameshiftVariant], 2, 1),
+            Some("Frame_Shift_Del")
+        );
+        // 2bp insertion (ref=1,alt=3 -> size 2, frameshift, insertion)
+        assert_eq!(
+            Consequence::maf_variant_classification_from(&[FrameshiftVariant], 1, 3),
+            Some("Frame_Shift_Ins")
+        );
+        // most-severe wins when multiple consequences present
+        assert_eq!(
+            Consequence::maf_variant_classification_from(
+                &[SpliceRegionVariant, MissenseVariant],
+                1,
+                1
+            ),
+            Some("Missense_Mutation")
+        );
+        assert_eq!(Consequence::maf_variant_classification_from(&[], 1, 1), None);
     }
 
     #[test]
